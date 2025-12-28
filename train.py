@@ -54,6 +54,10 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# tropical attention settings
+tropical_attention = False  # use Tropical (Max-Plus) attention
+tropical_temperature = 1.0  # initial temperature for LogSumExp (annealed during training)
+tropical_min_temperature = 0.01  # minimum temperature to anneal toward
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -106,10 +110,20 @@ if master_process:
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+# Determine device type for autocast
+if 'cuda' in device:
+    device_type = 'cuda'
+elif 'mps' in device:
+    device_type = 'mps'
+else:
+    device_type = 'cpu'
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+# MPS and CPU don't benefit from autocast, use nullcontext
+if device_type == 'cuda':
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+else:
+    ctx = nullcontext()
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -145,7 +159,9 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  tropical_attention=tropical_attention,
+                  tropical_temperature=tropical_temperature) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -193,7 +209,8 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# Only use GradScaler for CUDA with float16
+scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16' and device_type == 'cuda'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -259,18 +276,31 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+    # anneal tropical temperature if using tropical attention
+    if tropical_attention:
+        # Exponential decay from tropical_temperature to tropical_min_temperature
+        progress = iter_num / max_iters
+        current_temp = tropical_temperature * (tropical_min_temperature / tropical_temperature) ** progress
+        # Update temperature in all attention blocks
+        for block in raw_model.transformer.h:
+            if hasattr(block.attn, 'temperature'):
+                block.attn.temperature = current_temp
+
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            if tropical_attention:
+                log_dict["tropical_temperature"] = current_temp
+            wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:

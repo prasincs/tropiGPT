@@ -75,6 +75,107 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class TropicalCausalSelfAttention(nn.Module):
+    """
+    Tropical (Max-Plus) Semiring Attention.
+
+    Replaces the standard Sum-Product operations with Max-Plus operations:
+    - Standard dot product: sum_d(Q[i,d] * K[j,d])
+    - Tropical dot product: max_d(Q[i,d] + K[j,d])
+
+    - Standard value aggregation: softmax(scores) @ V (weighted sum)
+    - Tropical value aggregation: max_j(S_norm[i,j] + V[j,d])
+
+    Uses LogSumExp approximation for differentiable training with temperature annealing.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # temperature for LogSumExp approximation (annealed during training)
+        self.temperature = getattr(config, 'tropical_temperature', 1.0)
+        # causal mask
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+
+    def tropical_logsumexp(self, x, dim):
+        """
+        Smooth max approximation: T * log(sum(exp(x/T)))
+        As T -> 0, this approaches max(x)
+        """
+        return self.temperature * torch.logsumexp(x / self.temperature, dim=dim)
+
+    def forward(self, x):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
+
+        # calculate query, key, values for all heads in batch
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        hs = C // self.n_head  # head size
+
+        # === TROPICAL ATTENTION ===
+
+        # 1. Tropical dot product: score[i,j] = max_d(Q[i,d] + K[j,d])
+        # Q: (B, nh, T, hs), K: (B, nh, T, hs)
+        # We need to compute for each (i, j) position: max over d of (Q[i,d] + K[j,d])
+        # Expand Q and K for broadcasting:
+        # Q: (B, nh, T, 1, hs) + K: (B, nh, 1, T, hs) -> (B, nh, T, T, hs)
+        q_expanded = q.unsqueeze(-2)  # (B, nh, T, 1, hs)
+        k_expanded = k.unsqueeze(-3)  # (B, nh, 1, T, hs)
+        qk_sum = q_expanded + k_expanded  # (B, nh, T, T, hs)
+
+        # Tropical max over the head dimension (smooth max via LogSumExp)
+        att = self.tropical_logsumexp(qk_sum, dim=-1)  # (B, nh, T, T)
+
+        # Scale by -0.5 * log(head_size) (tropical equivalent of 1/sqrt(d_k))
+        # In tropical semiring, division becomes subtraction
+        att = att - 0.5 * math.log(hs)
+
+        # 2. Causal masking: set future positions to -inf
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+
+        # 3. Tropical normalization: scores - max(scores)
+        # This normalizes so the max score is 0
+        att_max = att.max(dim=-1, keepdim=True).values
+        # Handle all -inf rows (shouldn't happen with causal but be safe)
+        att_max = torch.where(att_max == float('-inf'), torch.zeros_like(att_max), att_max)
+        att_normalized = att - att_max  # (B, nh, T, T), max is 0, rest are negative
+
+        # Apply dropout to attention scores
+        att_normalized = self.attn_dropout(att_normalized)
+
+        # 4. Tropical matrix multiplication with V: Output[i,d] = max_j(S_norm[i,j] + V[j,d])
+        # att_normalized: (B, nh, T, T), V: (B, nh, T, hs)
+        # For each output position (i, d): max over j of (att_normalized[i,j] + V[j,d])
+        # Expand for broadcasting:
+        # att_normalized: (B, nh, T, T, 1) + V: (B, nh, 1, T, hs) -> (B, nh, T, T, hs)
+        att_expanded = att_normalized.unsqueeze(-1)  # (B, nh, T, T, 1)
+        v_expanded = v.unsqueeze(-3)  # (B, nh, 1, T, hs)
+        sv_sum = att_expanded + v_expanded  # (B, nh, T, T, hs)
+
+        # Tropical max over the key/value dimension (smooth max via LogSumExp)
+        y = self.tropical_logsumexp(sv_sum, dim=-2)  # (B, nh, T, hs)
+
+        # Reassemble all head outputs
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -96,7 +197,11 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        # Use Tropical attention if configured
+        if getattr(config, 'tropical_attention', False):
+            self.attn = TropicalCausalSelfAttention(config)
+        else:
+            self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -114,6 +219,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    tropical_attention: bool = False  # Use Tropical (Max-Plus) attention instead of standard
+    tropical_temperature: float = 1.0  # Temperature for LogSumExp (annealed toward 0 during training)
 
 class GPT(nn.Module):
 
