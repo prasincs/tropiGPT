@@ -1,0 +1,314 @@
+# Tropical GPT Research Roadmap
+
+## Current Status
+
+We implemented Tropical (Max-Plus) Attention and tested it on 3-digit addition. Key finding: **neither standard nor tropical attention generalizes to different digit lengths** due to positional overfitting.
+
+This roadmap outlines follow-up research directions to properly test the tropical attention hypothesis.
+
+---
+
+## Priority 1: Fix Positional Overfitting
+
+These experiments address the root cause of the current failure.
+
+### 1.1 Variable-Length Training Data
+**Difficulty**: Easy | **Impact**: High
+
+Train on mixed digit lengths to prevent position memorization.
+
+```python
+# In data/adder/prepare.py, modify:
+def generate_addition_problem():
+    num_digits = random.choice([2, 3, 4, 5])  # Variable lengths
+    # ... rest of generation
+```
+
+**Hypothesis**: Both models should improve on OOD, but tropical may show steeper improvement curve.
+
+---
+
+### 1.2 Reversed Digit Order (Little-Endian)
+**Difficulty**: Easy | **Impact**: High
+
+Present numbers least-significant digit first:
+- Standard: `123+456=579`
+- Reversed: `321+654=975`
+
+This aligns carry propagation with left-to-right autoregressive generation.
+
+```python
+def reverse_digits(n):
+    return str(n)[::-1]
+
+# "321+654=975\n" instead of "123+456=579\n"
+```
+
+**Hypothesis**: Tropical attention should excel here since carries propagate in generation order.
+
+---
+
+### 1.3 Relative Positional Encoding (RoPE/ALiBi)
+**Difficulty**: Medium | **Impact**: High
+
+Replace absolute position embeddings with relative positional encoding.
+
+```python
+# In model.py, replace wpe with RoPE
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # Rotary position embedding implementation
+    ...
+```
+
+**Hypothesis**: Should enable both models to generalize to longer sequences. Tropical may still show advantage.
+
+---
+
+## Priority 2: Better Arithmetic Tasks
+
+Test tropical attention on tasks that more directly require discrete/algorithmic reasoning.
+
+### 2.1 Binary Addition
+**Difficulty**: Easy | **Impact**: Medium
+
+Use binary representation where carry is explicit:
+- `1011+0110=10001` (11+6=17 in decimal)
+
+**Hypothesis**: Tropical attention should show clearer advantage with explicit binary carries.
+
+---
+
+### 2.2 Multiplication
+**Difficulty**: Medium | **Impact**: High
+
+Multiplication requires tracking multiple partial products:
+- `12*34=408`
+
+**Hypothesis**: More complex attention patterns may benefit more from tropical sharpness.
+
+---
+
+### 2.3 Modular Arithmetic
+**Difficulty**: Easy | **Impact**: Medium
+
+Compute `(a + b) mod p` for small primes p.
+
+**Hypothesis**: Discrete modular structure may align well with tropical max operations.
+
+---
+
+### 2.4 Sorting / Comparison
+**Difficulty**: Medium | **Impact**: High
+
+Sort a sequence of numbers:
+- Input: `[5,2,8,1,9]`
+- Output: `[1,2,5,8,9]`
+
+**Hypothesis**: Sorting requires discrete comparisons (max/min) - perfect for tropical semiring.
+
+---
+
+## Priority 3: Architectural Variations
+
+Explore different ways to incorporate tropical operations.
+
+### 3.1 Hybrid Attention (Tropical + Softmax)
+**Difficulty**: Medium | **Impact**: Medium
+
+Use tropical attention in early layers, softmax in later layers (or vice versa).
+
+```python
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        if layer_idx < config.n_layer // 2:
+            self.attn = TropicalCausalSelfAttention(config)
+        else:
+            self.attn = CausalSelfAttention(config)
+```
+
+**Hypothesis**: Different layers may benefit from different inductive biases.
+
+---
+
+### 3.2 Tropical MLP
+**Difficulty**: Hard | **Impact**: High
+
+Extend tropical operations to the MLP blocks:
+- Standard: `GELU(xW1) @ W2`
+- Tropical: `max(x + W1) + W2` (in log space)
+
+**Hypothesis**: Full tropical network may unlock more compositional reasoning.
+
+---
+
+### 3.3 Tropical Embeddings
+**Difficulty**: Medium | **Impact**: Medium
+
+Use additive (tropical) token embeddings instead of lookup:
+- Each token has a "tropical embedding" that combines additively
+
+**Hypothesis**: May provide more compositional token representations.
+
+---
+
+## Priority 4: Training Dynamics
+
+Improve how tropical models are trained.
+
+### 4.1 Curriculum Temperature Annealing
+**Difficulty**: Easy | **Impact**: Medium
+
+Anneal temperature in stages tied to data complexity:
+1. Train on 2-digit at T=1.0
+2. Add 3-digit, anneal to T=0.5
+3. Add 4-digit, anneal to T=0.1
+
+**Hypothesis**: Gradual curriculum may improve convergence.
+
+---
+
+### 4.2 Straight-Through Estimator
+**Difficulty**: Medium | **Impact**: Medium
+
+Use hard max in forward pass, but soft gradients in backward:
+
+```python
+def tropical_max_ste(x, dim):
+    hard = x.max(dim=dim).values
+    soft = temperature * torch.logsumexp(x / temperature, dim=dim)
+    return hard + (soft - soft.detach())  # Straight-through
+```
+
+**Hypothesis**: May enable training with truly discrete attention while maintaining gradient flow.
+
+---
+
+### 4.3 Gumbel-Max Tropical Attention
+**Difficulty**: Medium | **Impact**: Medium
+
+Add Gumbel noise for stochastic hard attention:
+
+```python
+def gumbel_tropical_max(x, dim, temperature):
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(x)))
+    return ((x + gumbel_noise) / temperature).max(dim=dim)
+```
+
+**Hypothesis**: Stochastic exploration may improve optimization landscape.
+
+---
+
+## Priority 5: Analysis & Interpretability
+
+Understand what tropical attention learns differently.
+
+### 5.1 Attention Pattern Visualization
+**Difficulty**: Easy | **Impact**: Medium
+
+Compare attention heatmaps between standard and tropical models.
+
+```python
+def visualize_attention(model, input_text):
+    # Extract and plot attention weights
+    ...
+```
+
+**Hypothesis**: Tropical attention should show sparser, more discrete patterns.
+
+---
+
+### 5.2 Probing for Carry Detection
+**Difficulty**: Medium | **Impact**: Medium
+
+Train linear probes on hidden states to detect carry signals.
+
+**Hypothesis**: Tropical models may have more explicit carry representations.
+
+---
+
+### 5.3 Loss Landscape Analysis
+**Difficulty**: Hard | **Impact**: Medium
+
+Visualize the loss landscape of tropical vs standard models.
+
+**Hypothesis**: Tropical may have sharper minima corresponding to discrete solutions.
+
+---
+
+## Quick Experiments (< 1 hour each)
+
+| Experiment | Priority | Difficulty |
+|------------|----------|------------|
+| Variable-length training data | 1.1 | Easy |
+| Reversed digit order | 1.2 | Easy |
+| Binary addition | 2.1 | Easy |
+| Attention visualization | 5.1 | Easy |
+| Curriculum annealing | 4.1 | Easy |
+
+---
+
+## Medium Experiments (1-4 hours each)
+
+| Experiment | Priority | Difficulty |
+|------------|----------|------------|
+| RoPE positional encoding | 1.3 | Medium |
+| Multiplication task | 2.2 | Medium |
+| Sorting task | 2.4 | Medium |
+| Hybrid attention layers | 3.1 | Medium |
+| Straight-through estimator | 4.2 | Medium |
+
+---
+
+## Research Experiments (1+ days)
+
+| Experiment | Priority | Difficulty |
+|------------|----------|------------|
+| Tropical MLP | 3.2 | Hard |
+| Loss landscape analysis | 5.3 | Hard |
+| Full tropical transformer | 3.2 + 3.3 | Hard |
+
+---
+
+## Recommended Next Steps
+
+1. **Quick win**: Try reversed digit order (1.2) - should take ~30 min
+2. **Proper test**: Variable-length training (1.1) - ~1 hour
+3. **New task**: Binary addition (2.1) - ~1 hour
+4. **Visualization**: Attention patterns (5.1) - ~30 min
+
+These four experiments would provide strong evidence for or against the tropical attention hypothesis.
+
+---
+
+## Success Metrics
+
+For any experiment, success is measured by:
+
+1. **OOD Generalization Gap**: `(ID accuracy) - (OOD accuracy)`
+   - Smaller gap = better generalization
+   - Tropical should have smaller gap than standard
+
+2. **Length Extrapolation**: Accuracy on lengths 2x training length
+   - Any non-zero accuracy = success
+
+3. **Sample Efficiency**: Iterations to reach 90% training accuracy
+   - Tropical may need more iterations due to harder optimization
+
+---
+
+## References for Further Reading
+
+1. **Tropical Geometry & Neural Networks**
+   - Zhang et al., "Tropical Geometry of Deep Neural Networks"
+
+2. **Length Generalization in Transformers**
+   - Anil et al., "Exploring Length Generalization in Large Language Models"
+   - Press et al., "Train Short, Test Long: Attention with Linear Biases"
+
+3. **Algorithmic Reasoning**
+   - Nye et al., "Show Your Work: Scratchpads for Intermediate Computation"
+   - Zhou et al., "Teaching Algorithmic Reasoning via In-context Learning"
+
+4. **Discrete Attention Mechanisms**
+   - Martins & Astudillo, "From Softmax to Sparsemax"
+   - Correia et al., "Adaptively Sparse Transformers"
