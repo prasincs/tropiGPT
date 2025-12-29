@@ -33,7 +33,7 @@ def compute_significance(text, reverse=False):
 
     return sig
 
-device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 
 def generate_test_problem(num_digits, reverse=False):
     """Generate a test problem with specific digit count."""
@@ -154,18 +154,24 @@ def main():
     # Auto-discover checkpoints
     experiments = []
     checkpoint_dirs = [
-        # 2k iteration experiments
+        # 2k iteration experiments (MPS)
         ("out-baseline/ckpt.pt", "Baseline (2k)"),
         ("out-abacus/ckpt.pt", "Abacus (2k)"),
         ("out-tropical/ckpt.pt", "Tropical (2k)"),
         ("out-tropigpt/ckpt.pt", "TropiGPT (2k)"),
-        # 10k iteration experiments
+        # 10k iteration experiments (MPS)
         ("out-baseline-10k/ckpt.pt", "Baseline (10k)"),
         ("out-abacus-10k/ckpt.pt", "Abacus (10k)"),
         ("out-tropical-10k/ckpt.pt", "Tropical (10k)"),
         ("out-tropigpt-10k/ckpt.pt", "TropiGPT (10k)"),
+        # 10k iteration experiments (CUDA)
+        ("out-baseline-10k-cuda/ckpt.pt", "Baseline (10k CUDA)"),
+        ("out-abacus-10k-cuda/ckpt.pt", "Abacus (10k CUDA)"),
+        ("out-tropical-10k-cuda/ckpt.pt", "Tropical (10k CUDA)"),
+        ("out-tropigpt-10k-cuda/ckpt.pt", "TropiGPT (10k CUDA)"),
         # 50k iteration experiments
         ("out-tropigpt-50k/ckpt.pt", "TropiGPT (50k)"),
+        ("out-tropigpt-50k-cuda/ckpt.pt", "TropiGPT (50k CUDA)"),
     ]
 
     for ckpt_path, name in checkpoint_dirs:
