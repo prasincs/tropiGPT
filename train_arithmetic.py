@@ -303,9 +303,12 @@ def compute_significance(text, reverse=False):
 
 
 @torch.no_grad()
-def evaluate_exact_match(num_digits, num_samples=100, reverse=False):
+def evaluate_exact_match_autoregressive(num_digits, num_samples=100, reverse=False):
     """
-    Evaluate exact match accuracy on addition problems.
+    Evaluate exact match accuracy using autoregressive generation.
+
+    This is the traditional approach where we generate tokens one by one.
+    Slower but tests true generation capability.
 
     Args:
         num_digits: Number of digits for operands
@@ -317,7 +320,6 @@ def evaluate_exact_match(num_digits, num_samples=100, reverse=False):
     """
     model.eval()
     correct = 0
-    max_seq = seq_length - 10  # Leave room for generation
 
     for _ in range(num_samples):
         prompt, answer, (a, b, c) = generate_test_problem(num_digits, reverse)
@@ -336,10 +338,9 @@ def evaluate_exact_match(num_digits, num_samples=100, reverse=False):
 
         # Generate answer tokens one by one
         generated = []
-        max_answer_len = min(len(answer) + 2, seq_length - len(tokens))  # Don't exceed block size
+        max_answer_len = min(len(answer) + 2, seq_length - len(tokens))
 
         for _ in range(max_answer_len):
-            # Check sequence length limit
             if input_ids.shape[1] >= seq_length:
                 break
 
@@ -358,32 +359,202 @@ def evaluate_exact_match(num_digits, num_samples=100, reverse=False):
             # Get next token (greedy)
             next_token = logits[0, -1, :].argmax().item()
 
-            # Check for newline (end of answer)
             if next_token == CHAR_TO_ID['\n']:
                 break
 
             generated.append(ID_TO_CHAR[next_token])
 
-            # Append to sequence
             input_ids = torch.cat([
                 input_ids,
                 torch.tensor([[next_token]], dtype=torch.long, device=device)
             ], dim=1)
 
-            # Update significance (new digit gets appropriate significance)
             new_sig = len(generated) if reverse else 1
             significance_ids = torch.cat([
                 significance_ids,
                 torch.tensor([[new_sig]], dtype=torch.long, device=device)
             ], dim=1)
 
-        # Check exact match
-        generated_str = ''.join(generated)
-        if generated_str == answer:
+        if ''.join(generated) == answer:
             correct += 1
 
     model.train()
     return correct / num_samples
+
+
+@torch.no_grad()
+def evaluate_exact_match(num_digits, num_samples=100, reverse=False):
+    """
+    Evaluate exact match accuracy using teacher-forcing (advanced method).
+
+    This approach:
+    1. Feeds the FULL problem (including answer) to the model in one pass
+    2. Finds the "=" token position
+    3. Extracts model predictions for tokens AFTER "="
+    4. Compares predicted digits to ground truth
+
+    Benefits:
+    - Much faster than autoregressive generation
+    - Avoids compounding errors during generation
+    - Directly measures if model learned the correct mapping
+
+    Args:
+        num_digits: Number of digits for operands
+        num_samples: Number of problems to test
+        reverse: Whether to use LSB-first format
+
+    Returns:
+        Accuracy (0.0 to 1.0)
+    """
+    model.eval()
+    correct = 0
+    total = 0
+
+    for _ in range(num_samples):
+        prompt, answer, (a, b, c) = generate_test_problem(num_digits, reverse)
+
+        # Create full problem string: "a + b = c\n"
+        full_problem = prompt + answer + "\n"
+
+        # Skip if too long for model
+        if len(full_problem) > seq_length:
+            continue
+
+        # Tokenize the full problem
+        tokens = [CHAR_TO_ID[ch] for ch in full_problem]
+        input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+
+        # Compute significance for full problem
+        sig = compute_significance(full_problem, reverse)
+        significance_ids = torch.tensor([sig], dtype=torch.long, device=device)
+
+        # Forward pass (teacher forcing - model sees full sequence)
+        if use_abacus:
+            logits, _ = model(input_ids, significance_ids=significance_ids)
+        else:
+            logits, _ = model(input_ids)
+
+        # Find the "=" position in the token sequence
+        equals_pos = None
+        for i, tok in enumerate(tokens):
+            if tok == CHAR_TO_ID['=']:
+                equals_pos = i
+                break
+
+        if equals_pos is None:
+            continue
+
+        # The answer starts after "= " (equals + space)
+        # Model predicts next token, so prediction for position i predicts token i+1
+        # To predict the first answer digit, we look at logits[equals_pos + 1] (after "= ")
+        answer_start = equals_pos + 2  # Skip "=" and " "
+
+        # Extract predictions for answer positions
+        # logits[i] predicts token at position i+1
+        predicted_tokens = []
+        for i in range(len(answer)):
+            pred_pos = answer_start + i - 1  # Position whose logits predict this answer token
+            if pred_pos >= 0 and pred_pos < logits.shape[1]:
+                pred_token = logits[0, pred_pos, :].argmax().item()
+                predicted_tokens.append(pred_token)
+
+        # Convert to string and compare
+        predicted_str = ''.join(ID_TO_CHAR.get(t, '?') for t in predicted_tokens)
+
+        if predicted_str == answer:
+            correct += 1
+        total += 1
+
+    model.train()
+    return correct / total if total > 0 else 0.0
+
+
+@torch.no_grad()
+def evaluate_per_digit_accuracy(num_digits, num_samples=100, reverse=False):
+    """
+    Evaluate per-digit accuracy (not requiring full exact match).
+
+    This measures what fraction of individual digits are correct,
+    even if the full answer isn't. Useful for understanding partial learning.
+
+    Args:
+        num_digits: Number of digits for operands
+        num_samples: Number of problems to test
+        reverse: Whether to use LSB-first format
+
+    Returns:
+        Dict with 'exact_match', 'per_digit', and 'per_position' accuracies
+    """
+    model.eval()
+    exact_correct = 0
+    digit_correct = 0
+    digit_total = 0
+    position_correct = {}  # Track accuracy by position
+    position_total = {}
+
+    for _ in range(num_samples):
+        prompt, answer, (a, b, c) = generate_test_problem(num_digits, reverse)
+        full_problem = prompt + answer + "\n"
+
+        if len(full_problem) > seq_length:
+            continue
+
+        tokens = [CHAR_TO_ID[ch] for ch in full_problem]
+        input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        sig = compute_significance(full_problem, reverse)
+        significance_ids = torch.tensor([sig], dtype=torch.long, device=device)
+
+        if use_abacus:
+            logits, _ = model(input_ids, significance_ids=significance_ids)
+        else:
+            logits, _ = model(input_ids)
+
+        equals_pos = None
+        for i, tok in enumerate(tokens):
+            if tok == CHAR_TO_ID['=']:
+                equals_pos = i
+                break
+
+        if equals_pos is None:
+            continue
+
+        answer_start = equals_pos + 2
+        all_correct = True
+
+        for i, true_char in enumerate(answer):
+            pred_pos = answer_start + i - 1
+            if pred_pos >= 0 and pred_pos < logits.shape[1]:
+                pred_token = logits[0, pred_pos, :].argmax().item()
+                pred_char = ID_TO_CHAR.get(pred_token, '?')
+
+                # Track per-position accuracy
+                if i not in position_correct:
+                    position_correct[i] = 0
+                    position_total[i] = 0
+                position_total[i] += 1
+
+                if pred_char == true_char:
+                    digit_correct += 1
+                    position_correct[i] += 1
+                else:
+                    all_correct = False
+                digit_total += 1
+
+        if all_correct:
+            exact_correct += 1
+
+    model.train()
+
+    # Compute per-position accuracies
+    per_position = {}
+    for pos in sorted(position_total.keys()):
+        per_position[pos] = position_correct[pos] / position_total[pos] if position_total[pos] > 0 else 0.0
+
+    return {
+        'exact_match': exact_correct / num_samples if num_samples > 0 else 0.0,
+        'per_digit': digit_correct / digit_total if digit_total > 0 else 0.0,
+        'per_position': per_position,
+    }
 
 
 @torch.no_grad()

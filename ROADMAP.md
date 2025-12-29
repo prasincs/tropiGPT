@@ -2,9 +2,30 @@
 
 ## Current Status
 
-We implemented Tropical (Max-Plus) Attention and tested it on 3-digit addition. Key finding: **neither standard nor tropical attention generalizes to different digit lengths** due to positional overfitting.
+We have implemented a comprehensive research framework for testing the Tropical Attention hypothesis on arithmetic tasks:
 
-This roadmap outlines follow-up research directions to properly test the tropical attention hypothesis.
+### ✅ Completed Implementations
+
+| Component | File | Description |
+|-----------|------|-------------|
+| **ArithmeticDataset** | `data/arithmetic_dataset.py` | Infinite IterableDataset with character-level tokenization |
+| **Abacus Embeddings** | `model.py` | Significance-based positional encoding (10^0, 10^1, etc.) |
+| **Tropical Attention** | `model.py` | Max-Plus semiring with stable LSE trick and temperature annealing |
+| **Muon Optimizer** | `model.py` | Newton-Schulz orthogonalization for weight matrices |
+| **Training Script** | `train_arithmetic.py` | Full training loop with curriculum and evaluation |
+
+### Key Insight: Evaluation Methodology
+
+We implemented two evaluation approaches:
+
+1. **Teacher-Forcing (Primary)**: Feed full problem to model, extract predictions after "=" token
+   - Faster and more reliable
+   - Directly measures learned mapping quality
+   - Avoids compounding autoregressive errors
+
+2. **Autoregressive (Secondary)**: Generate tokens one by one
+   - Tests true generation capability
+   - Slower, more susceptible to error propagation
 
 ---
 
@@ -271,12 +292,40 @@ Visualize the loss landscape of tropical vs standard models.
 
 ## Recommended Next Steps
 
-1. **Quick win**: Try reversed digit order (1.2) - should take ~30 min
-2. **Proper test**: Variable-length training (1.1) - ~1 hour
-3. **New task**: Binary addition (2.1) - ~1 hour
-4. **Visualization**: Attention patterns (5.1) - ~30 min
+### Immediate (Infrastructure Ready)
 
-These four experiments would provide strong evidence for or against the tropical attention hypothesis.
+```bash
+# 1. Baseline: Standard attention without Abacus
+python train_arithmetic.py --max_iters=5000 --tropical_attention=False --use_abacus=False
+
+# 2. Abacus only: Test if significance embeddings help
+python train_arithmetic.py --max_iters=5000 --tropical_attention=False --use_abacus=True
+
+# 3. Tropical only: Test tropical attention alone
+python train_arithmetic.py --max_iters=5000 --tropical_attention=True --use_abacus=False
+
+# 4. Full TropiGPT: Tropical + Abacus + Muon
+python train_arithmetic.py --max_iters=5000 --tropical_attention=True --use_abacus=True --use_muon=True
+
+# 5. Reversed digits (LSB-first): Better carry alignment
+python train_arithmetic.py --max_iters=5000 --tropical_attention=True --use_abacus=True --reverse_digits=True
+```
+
+### Key Experiments
+
+| Experiment | Command | Hypothesis |
+|------------|---------|------------|
+| Baseline | `--tropical_attention=False` | Standard transformer baseline |
+| Abacus Embeddings | `--use_abacus=True` | Significance alignment improves generalization |
+| Tropical Attention | `--tropical_attention=True` | Discrete attention helps carry propagation |
+| LSB-First | `--reverse_digits=True` | Carry aligns with generation order |
+| Full Stack | All flags | Combined benefits |
+
+### Success Criteria
+
+- **ID Accuracy (10-digit)**: Should reach >90% with good configuration
+- **OOD Accuracy (20-digit)**: >50% indicates generalization
+- **OOD Accuracy (100-digit)**: Any non-zero indicates strong generalization
 
 ---
 
@@ -293,6 +342,48 @@ For any experiment, success is measured by:
 
 3. **Sample Efficiency**: Iterations to reach 90% training accuracy
    - Tropical may need more iterations due to harder optimization
+
+4. **Per-Digit Accuracy**: Fraction of correct digits (even if full answer wrong)
+   - Use `evaluate_per_digit_accuracy()` for fine-grained analysis
+   - Reveals which positions are hardest (usually carry positions)
+
+---
+
+## Evaluation Methodology
+
+### Teacher-Forcing Evaluation (Recommended)
+
+```python
+# From train_arithmetic.py
+def evaluate_exact_match(num_digits, num_samples=100, reverse=False):
+    """
+    1. Feed FULL problem (including answer) to model
+    2. Find "=" token position
+    3. Extract predictions for tokens AFTER "="
+    4. Compare to ground truth
+    """
+```
+
+**Why this approach?**
+- Single forward pass per problem (fast)
+- No error accumulation from autoregressive sampling
+- Directly measures if model learned the mapping
+- Consistent with how we compute training loss
+
+### Per-Position Analysis
+
+```python
+results = evaluate_per_digit_accuracy(num_digits=20, num_samples=100)
+# Returns:
+# - exact_match: Full answer accuracy
+# - per_digit: Average digit accuracy
+# - per_position: {0: 0.95, 1: 0.87, 2: 0.72, ...}  # Position 2 is hardest (carry!)
+```
+
+This reveals:
+- Which digit positions the model struggles with
+- Whether errors cluster at carry positions
+- If Abacus embeddings help align carries
 
 ---
 
