@@ -292,23 +292,41 @@ Visualize the loss landscape of tropical vs standard models.
 
 ## Recommended Next Steps
 
-### Immediate (Infrastructure Ready)
+### Completed: 2k Iteration Experiments
+
+Initial experiments (2000 iterations) showed:
+- All models: 0% exact match accuracy
+- Tropical attention: 22% per-digit accuracy (2x baseline 12%)
+- Abacus embeddings: Best val loss (0.135)
+
+**Conclusion**: 2000 iterations insufficient. Models learn format but not arithmetic.
+
+### Next: Longer Training Experiments
 
 ```bash
-# 1. Baseline: Standard attention without Abacus
-python train_arithmetic.py --max_iters=5000 --tropical_attention=False --use_abacus=False
+# Phase 1: 10k iterations (estimate ~2-4 hours for tropical)
+# Baseline
+PYTHONUNBUFFERED=1 .venv/bin/python train_arithmetic.py --max_iters=10000 --eval_interval=1000 --tropical_attention=False --use_abacus=False --out_dir=out-baseline-10k
 
-# 2. Abacus only: Test if significance embeddings help
-python train_arithmetic.py --max_iters=5000 --tropical_attention=False --use_abacus=True
+# Abacus only
+PYTHONUNBUFFERED=1 .venv/bin/python train_arithmetic.py --max_iters=10000 --eval_interval=1000 --tropical_attention=False --use_abacus=True --out_dir=out-abacus-10k
 
-# 3. Tropical only: Test tropical attention alone
-python train_arithmetic.py --max_iters=5000 --tropical_attention=True --use_abacus=False
+# Tropical only (use batch_size=16 for MPS memory)
+PYTHONUNBUFFERED=1 .venv/bin/python train_arithmetic.py --max_iters=10000 --eval_interval=1000 --tropical_attention=True --use_abacus=False --out_dir=out-tropical-10k --batch_size=16
 
-# 4. Full TropiGPT: Tropical + Abacus + Muon
-python train_arithmetic.py --max_iters=5000 --tropical_attention=True --use_abacus=True --use_muon=True
+# TropiGPT (Tropical + Abacus)
+PYTHONUNBUFFERED=1 .venv/bin/python train_arithmetic.py --max_iters=10000 --eval_interval=1000 --tropical_attention=True --use_abacus=True --out_dir=out-tropigpt-10k --batch_size=16
 
-# 5. Reversed digits (LSB-first): Better carry alignment
-python train_arithmetic.py --max_iters=5000 --tropical_attention=True --use_abacus=True --reverse_digits=True
+# Phase 2: 50k iterations (estimate ~10-20 hours for tropical)
+# Only run promising configurations from Phase 1
+PYTHONUNBUFFERED=1 .venv/bin/python train_arithmetic.py --max_iters=50000 --eval_interval=5000 --tropical_attention=True --use_abacus=True --out_dir=out-tropigpt-50k --batch_size=16
+```
+
+### Evaluation After Training
+
+```bash
+# Compare all checkpoints
+.venv/bin/python compare_experiments.py
 ```
 
 ### Key Experiments

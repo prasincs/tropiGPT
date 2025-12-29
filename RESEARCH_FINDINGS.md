@@ -79,11 +79,83 @@ Training anneals T from 1.0 → 0.1 over the course of training.
 | 3-digit Accuracy | 98.5% | 95.5% |
 | OOD Accuracy | 0.0% | 0.0% |
 
-### 3.3 Conclusion
+### 3.3 Follow-up Experiment: Variable-Length Training
 
-**Neither model generalizes to out-of-distribution digit lengths.**
+To test if training on mixed digit lengths prevents positional memorization:
 
-Both models achieve high accuracy (~95-98%) on the training distribution but **completely fail** (0%) on all other digit lengths—including 2-digit problems which are strictly simpler.
+| Digits | Type | Standard GPT | Tropical GPT |
+|--------|------|--------------|--------------|
+| 2-digit | Training | **100%** | 93% |
+| 3-digit | Training | **97%** | 88% |
+| 4-digit | Training | **95%** | 83% |
+| 5-digit | Training | **95%** | 56% |
+| 6-digit | OOD | 0% | 0% |
+| 7-digit | OOD | 0% | 0% |
+| 8-digit | OOD | 0% | 0% |
+
+**Key Finding**: Standard GPT significantly outperforms Tropical GPT on variable-length training! Standard maintains high accuracy (95-100%) while Tropical degrades severely (56% on 5-digit).
+
+### 3.4 Follow-up Experiment: Reversed Digit Order
+
+Tested little-endian format (`321+654=975` instead of `123+456=579`):
+
+| Model | 3-digit Accuracy |
+|-------|------------------|
+| Standard GPT | 13% |
+| Tropical GPT | ~15% |
+
+**Key Finding**: Reversed format is significantly harder for both models. Neither learns it well.
+
+### 3.6 Follow-up Experiment: Binary Addition (4-bit)
+
+Tested binary representation where carries are explicit:
+
+| Model | 4-bit Accuracy |
+|-------|----------------|
+| Standard GPT | **99.5%** |
+| Tropical GPT | 0.0% |
+
+**Key Finding**: Tropical attention COMPLETELY FAILS on binary addition. Standard GPT nearly masters it while Tropical cannot learn it at all. This is strong evidence against the tropical attention hypothesis.
+
+### 3.7 Follow-up Experiment: Abacus Embeddings + Tropical Attention (TropiGPT v2)
+
+**Date**: December 29, 2024
+
+Implemented comprehensive TropiGPT with:
+- **Abacus Embeddings**: Position encoding based on digit significance (10^0, 10^1, etc.)
+- **Tropical Attention**: LogSumExp approximation with temperature annealing (1.0 → 0.01)
+- **Training**: 2000 iterations on 1-10 digit addition, batch_size=16/64
+
+| Configuration | Val Loss | Exact Match | Answer Digit Acc |
+|--------------|----------|-------------|------------------|
+| Baseline | 0.172 | 0% | 12.3% |
+| Abacus Only | **0.135** | 0% | 11.6% |
+| Tropical Only | 0.172 | 0% | **22.4%** |
+| TropiGPT (both) | 0.152 | 0% | 19.8% |
+
+**Key Finding**: Tropical attention **doubles** per-digit accuracy on answer tokens (22.4% vs 12.3% baseline). However, 0% exact match remains because multi-digit answers require ALL digits correct.
+
+**Per-Category Token Accuracy Analysis** (Abacus model):
+| Token Type | Accuracy | Notes |
+|------------|----------|-------|
+| Operators (+, =) | 100% | Perfect |
+| Spaces | 100% | Perfect |
+| Newlines | 100% | Perfect |
+| Input Digits | 10% | Random guessing |
+| Answer Digits | 11-22% | Slightly above random |
+
+The models learn **format perfectly** but only slightly better than random on **actual digits**. The low validation loss (0.13-0.17) is driven by perfect prediction of non-digit tokens.
+
+### 3.8 Conclusion
+
+**Standard GPT outperforms Tropical GPT across ALL experiments.**
+
+- Fixed-length 3-digit: Standard (98.5%) ≈ Tropical (95.5%)
+- Variable-length: Standard (95-100%) >> Tropical (56-93%)
+- Reversed digits: Both fail (~13-15%)
+- Binary addition: Standard (99.5%) >>> Tropical (0%)
+- OOD generalization: Both fail (0%)
+- **NEW**: Tropical attention improves per-digit accuracy 2x (22% vs 12%) but not enough for exact match
 
 ---
 
@@ -107,13 +179,15 @@ The failure is **not due to the attention mechanism** but to **positional overfi
 
 ### 4.2 Why Tropical Attention Didn't Help
 
-The tropical semiring hypothesis targets **attention pattern sharpness**—the idea that discrete, hard attention would better capture algorithmic steps. However:
+The tropical semiring hypothesis targets **attention pattern sharpness**—the idea that discrete, hard attention would better capture algorithmic steps. However, our experiments show:
 
-1. **The bottleneck isn't attention sharpness**: Both models learn to attend correctly within the training format.
+1. **Tropical attention hurts performance**: In variable-length and binary tasks, tropical attention performs significantly worse than standard attention.
 
-2. **The bottleneck is positional generalization**: Neither model understands that digit positions are relative, not absolute.
+2. **The LogSumExp approximation may be the problem**: Training tropical attention requires a differentiable approximation (LogSumExp with temperature annealing). This may not converge well, especially on tasks requiring precise discrete reasoning.
 
-3. **Tropical attention works**: It learns the training task (95.5% accuracy), proving the implementation is correct.
+3. **Standard softmax attention is already sufficient**: For arithmetic tasks within the training distribution, standard attention achieves near-perfect accuracy (98-99.5%).
+
+4. **Tropical attention may need different training dynamics**: The temperature annealing schedule (1.0 → 0.1) may not be optimal. The model may need curriculum learning or different optimization.
 
 ### 4.3 The "Carry Problem" Remains Unsolved
 
@@ -142,6 +216,12 @@ Replace absolute position embeddings with relative positional encoding (e.g., Ro
 
 ### 5.5 Scratchpad / Chain-of-Thought
 Train with intermediate computation steps visible, allowing the model to "show its work."
+
+### 5.6 Longer Training
+The TropiGPT v2 experiments only ran 2000 iterations. Standard nanoGPT arithmetic experiments typically need 10,000-50,000 iterations. The 22% per-digit accuracy for Tropical attention (vs 12% baseline) suggests potential that might be realized with longer training.
+
+### 5.7 Better Evaluation Metrics
+Focus on per-digit accuracy rather than exact match when comparing approaches. A model with 50% per-digit accuracy is significantly better than 10% (random), even if both show 0% exact match.
 
 ---
 
