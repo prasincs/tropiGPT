@@ -15,6 +15,130 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# =============================================================================
+# Muon Optimizer with Newton-Schulz Orthogonalization
+# =============================================================================
+
+@torch.no_grad()
+def newton_schulz_orthogonalize(X, num_iters=5):
+    """
+    Orthogonalize a 2D matrix using Newton-Schulz iteration.
+
+    The iteration: X_{k+1} = 0.5 * X_k @ (3I - X_k^T @ X_k)
+    Converges to an orthogonal matrix when ||X|| < sqrt(3).
+
+    Args:
+        X: 2D tensor to orthogonalize
+        num_iters: Number of Newton-Schulz iterations (default: 5)
+
+    Returns:
+        Orthogonalized matrix with the same shape as X
+    """
+    assert X.ndim == 2, f"Newton-Schulz requires 2D tensor, got {X.ndim}D"
+
+    # Normalize to ensure convergence (||X|| < sqrt(3))
+    X = X / (X.norm() + 1e-7)
+
+    # Newton-Schulz iteration
+    for _ in range(num_iters):
+        A = X.T @ X
+        I = torch.eye(A.shape[0], device=X.device, dtype=X.dtype)
+        X = 0.5 * X @ (3 * I - A)
+
+    return X
+
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon optimizer: Momentum + Newton-Schulz orthogonalization.
+
+    Designed for training weight matrices in transformers. Uses momentum
+    to accumulate gradients, then orthogonalizes the update direction
+    using Newton-Schulz iteration before applying it.
+
+    Critical: Only works on 2D tensors (weight matrices).
+
+    Args:
+        params: Parameters to optimize (must all be 2D)
+        lr: Learning rate (default: 0.02)
+        momentum: Momentum coefficient (default: 0.95)
+        ns_iters: Number of Newton-Schulz iterations (default: 5)
+
+    Reference:
+        https://kellerjordan.github.io/posts/muon/
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, ns_iters=5):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if momentum < 0.0 or momentum >= 1.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+
+        defaults = dict(lr=lr, momentum=momentum, ns_iters=ns_iters)
+        super().__init__(params, defaults)
+
+        # Validate all params are 2D
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.ndim < 2:
+                    raise ValueError(
+                        f"Muon only supports tensors with ndim >= 2, got {p.ndim}D tensor"
+                    )
+
+    def step(self, closure=None):
+        """Performs a single optimization step."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            ns_iters = group['ns_iters']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+
+                # Get or initialize momentum buffer
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(grad)
+
+                buf = state['momentum_buffer']
+
+                # Update momentum buffer: buf = momentum * buf + grad
+                buf.mul_(momentum).add_(grad)
+
+                # Orthogonalize the update direction using Newton-Schulz
+                # Handle non-square matrices by reshaping if needed
+                if buf.shape[0] > buf.shape[1]:
+                    # Tall matrix: orthogonalize and scale
+                    update = newton_schulz_orthogonalize(buf, ns_iters)
+                elif buf.shape[0] < buf.shape[1]:
+                    # Wide matrix: transpose, orthogonalize, transpose back
+                    update = newton_schulz_orthogonalize(buf.T, ns_iters).T
+                else:
+                    # Square matrix
+                    update = newton_schulz_orthogonalize(buf, ns_iters)
+
+                # Scale update by sqrt of dimensions for consistent magnitude
+                scale = math.sqrt(max(buf.shape[0], buf.shape[1]))
+                update = update * scale
+
+                # Apply the update
+                p.data.add_(update, alpha=-lr)
+
+        return loss
+
+
+# =============================================================================
+# Model Components
+# =============================================================================
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -463,31 +587,101 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type,
+                             use_muon=False, muon_lr=0.02, muon_momentum=0.95):
+        """
+        Configure optimizers for training.
 
-        return optimizer
+        When use_muon=True, splits parameters between Muon and AdamW:
+        - Muon: 2D internal weights (attn.c_attn, attn.c_proj, mlp.c_fc, mlp.c_proj)
+        - AdamW: Embeddings (wte, wpe, wse), LayerNorms (1D), Biases (1D)
+
+        Args:
+            weight_decay: Weight decay for AdamW
+            learning_rate: Learning rate for AdamW
+            betas: Beta coefficients for AdamW
+            device_type: Device type ('cuda', 'cpu', 'mps')
+            use_muon: Whether to use Muon optimizer for internal weights
+            muon_lr: Learning rate for Muon (default: 0.02)
+            muon_momentum: Momentum for Muon (default: 0.95)
+
+        Returns:
+            If use_muon=False: Single AdamW optimizer
+            If use_muon=True: List of [Muon, AdamW] optimizers
+        """
+        # Collect all parameters that require gradients
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+        if use_muon:
+            # Split parameters between Muon and AdamW
+            muon_params = []      # 2D internal weights -> Muon
+            adamw_decay = []      # 2D embeddings -> AdamW with decay
+            adamw_nodecay = []    # 1D params (biases, layernorms) -> AdamW no decay
+
+            for name, param in param_dict.items():
+                # Embeddings go to AdamW (even though they're 2D)
+                if any(emb in name for emb in ['wte', 'wpe', 'wse', 'lm_head']):
+                    adamw_decay.append(param)
+                # 2D weights in transformer blocks go to Muon
+                elif param.ndim >= 2 and any(w in name for w in ['c_attn', 'c_proj', 'c_fc']):
+                    muon_params.append(param)
+                # 2D params not in blocks (shouldn't happen, but just in case)
+                elif param.ndim >= 2:
+                    adamw_decay.append(param)
+                # 1D params (biases, layernorms) go to AdamW without decay
+                else:
+                    adamw_nodecay.append(param)
+
+            # Report parameter counts
+            num_muon = sum(p.numel() for p in muon_params)
+            num_adamw_decay = sum(p.numel() for p in adamw_decay)
+            num_adamw_nodecay = sum(p.numel() for p in adamw_nodecay)
+            print(f"Muon params: {len(muon_params)} tensors, {num_muon:,} parameters")
+            print(f"AdamW decay params: {len(adamw_decay)} tensors, {num_adamw_decay:,} parameters")
+            print(f"AdamW no-decay params: {len(adamw_nodecay)} tensors, {num_adamw_nodecay:,} parameters")
+
+            optimizers = []
+
+            # Create Muon optimizer for internal weights
+            if muon_params:
+                muon_opt = Muon(muon_params, lr=muon_lr, momentum=muon_momentum)
+                optimizers.append(muon_opt)
+                print(f"Using Muon optimizer with lr={muon_lr}, momentum={muon_momentum}")
+
+            # Create AdamW optimizer for embeddings and 1D params
+            adamw_groups = [
+                {'params': adamw_decay, 'weight_decay': weight_decay},
+                {'params': adamw_nodecay, 'weight_decay': 0.0}
+            ]
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            adamw_opt = torch.optim.AdamW(adamw_groups, lr=learning_rate, betas=betas, **extra_args)
+            optimizers.append(adamw_opt)
+            print(f"Using fused AdamW: {use_fused}")
+
+            return optimizers
+
+        else:
+            # Original behavior: single AdamW optimizer
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0}
+            ]
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+            # Create AdamW optimizer and use the fused version if it is available
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            print(f"using fused AdamW: {use_fused}")
+
+            return optimizer
 
     def set_tropical_temperature(self, temperature: float):
         """
