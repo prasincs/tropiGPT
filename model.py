@@ -77,7 +77,7 @@ class CausalSelfAttention(nn.Module):
 
 class TropicalCausalSelfAttention(nn.Module):
     """
-    Tropical (Max-Plus) Semiring Attention.
+    Tropical (Max-Plus) Semiring Attention with temperature annealing.
 
     Replaces the standard Sum-Product operations with Max-Plus operations:
     - Standard dot product: sum_d(Q[i,d] * K[j,d])
@@ -86,7 +86,13 @@ class TropicalCausalSelfAttention(nn.Module):
     - Standard value aggregation: softmax(scores) @ V (weighted sum)
     - Tropical value aggregation: max_j(S_norm[i,j] + V[j,d])
 
-    Uses LogSumExp approximation for differentiable training with temperature annealing.
+    Uses LogSumExp approximation for differentiable training.
+    Temperature τ controls the smoothness:
+    - τ = 1.0: Behaves like softmax (smooth, differentiable)
+    - τ → 0.01: Approaches hard max (tropical semiring)
+
+    The LSE Trick for numerical stability:
+        y = max_val + τ * log(sum(exp((x - max_val) / τ)))
     """
 
     def __init__(self, config):
@@ -102,18 +108,46 @@ class TropicalCausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # temperature for LogSumExp approximation (annealed during training)
-        self.temperature = getattr(config, 'tropical_temperature', 1.0)
+        # Temperature as a buffer (not a parameter) - annealed externally during training
+        # This allows external control: model.transformer.h[i].attn.temperature.fill_(new_temp)
+        init_temp = getattr(config, 'tropical_temperature', 1.0)
+        self.register_buffer("temperature", torch.tensor(init_temp))
         # causal mask
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .view(1, 1, config.block_size, config.block_size))
 
-    def tropical_logsumexp(self, x, dim):
+    def stable_tropical_logsumexp(self, x, dim):
         """
-        Smooth max approximation: T * log(sum(exp(x/T)))
-        As T -> 0, this approaches max(x)
+        Numerically stable smooth max using the LSE trick.
+
+        LSE Trick: y = max_val + τ * log(sum(exp((x - max_val) / τ)))
+
+        As τ → 0, this approaches max(x).
+        As τ → ∞, this approaches mean(x) (up to a constant).
+
+        Args:
+            x: Input tensor
+            dim: Dimension to reduce over
+
+        Returns:
+            Smooth max approximation along the specified dimension
         """
-        return self.temperature * torch.logsumexp(x / self.temperature, dim=dim)
+        tau = self.temperature.clamp(min=1e-6)  # Prevent division by zero
+
+        # LSE Trick: subtract max for numerical stability
+        max_val = x.max(dim=dim, keepdim=True).values
+        # Handle -inf values (from masking)
+        max_val = torch.where(
+            torch.isinf(max_val) & (max_val < 0),
+            torch.zeros_like(max_val),
+            max_val
+        )
+
+        # Stable computation: max + τ * log(sum(exp((x - max) / τ)))
+        shifted = (x - max_val) / tau
+        result = max_val.squeeze(dim) + tau * torch.logsumexp(shifted, dim=dim)
+
+        return result
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
@@ -132,13 +166,12 @@ class TropicalCausalSelfAttention(nn.Module):
         # Q: (B, nh, T, hs), K: (B, nh, T, hs)
         # We need to compute for each (i, j) position: max over d of (Q[i,d] + K[j,d])
         # Expand Q and K for broadcasting:
-        # Q: (B, nh, T, 1, hs) + K: (B, nh, 1, T, hs) -> (B, nh, T, T, hs)
         q_expanded = q.unsqueeze(-2)  # (B, nh, T, 1, hs)
         k_expanded = k.unsqueeze(-3)  # (B, nh, 1, T, hs)
         qk_sum = q_expanded + k_expanded  # (B, nh, T, T, hs)
 
-        # Tropical max over the head dimension (smooth max via LogSumExp)
-        att = self.tropical_logsumexp(qk_sum, dim=-1)  # (B, nh, T, T)
+        # Tropical max over the head dimension (smooth max via stable LogSumExp)
+        att = self.stable_tropical_logsumexp(qk_sum, dim=-1)  # (B, nh, T, T)
 
         # Scale by -0.5 * log(head_size) (tropical equivalent of 1/sqrt(d_k))
         # In tropical semiring, division becomes subtraction
@@ -148,26 +181,26 @@ class TropicalCausalSelfAttention(nn.Module):
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
 
         # 3. Tropical normalization: scores - max(scores)
-        # This normalizes so the max score is 0
+        # This normalizes so the max score is 0 (equivalent to softmax normalization)
         att_max = att.max(dim=-1, keepdim=True).values
-        # Handle all -inf rows (shouldn't happen with causal but be safe)
-        att_max = torch.where(att_max == float('-inf'), torch.zeros_like(att_max), att_max)
+        att_max = torch.where(
+            torch.isinf(att_max) & (att_max < 0),
+            torch.zeros_like(att_max),
+            att_max
+        )
         att_normalized = att - att_max  # (B, nh, T, T), max is 0, rest are negative
 
         # Apply dropout to attention scores
         att_normalized = self.attn_dropout(att_normalized)
 
         # 4. Tropical matrix multiplication with V: Output[i,d] = max_j(S_norm[i,j] + V[j,d])
-        # att_normalized: (B, nh, T, T), V: (B, nh, T, hs)
-        # For each output position (i, d): max over j of (att_normalized[i,j] + V[j,d])
         # Expand for broadcasting:
-        # att_normalized: (B, nh, T, T, 1) + V: (B, nh, 1, T, hs) -> (B, nh, T, T, hs)
         att_expanded = att_normalized.unsqueeze(-1)  # (B, nh, T, T, 1)
         v_expanded = v.unsqueeze(-3)  # (B, nh, 1, T, hs)
         sv_sum = att_expanded + v_expanded  # (B, nh, T, T, hs)
 
-        # Tropical max over the key/value dimension (smooth max via LogSumExp)
-        y = self.tropical_logsumexp(sv_sum, dim=-2)  # (B, nh, T, hs)
+        # Tropical max over the key/value dimension (smooth max via stable LogSumExp)
+        y = self.stable_tropical_logsumexp(sv_sum, dim=-2)  # (B, nh, T, hs)
 
         # Reassemble all head outputs
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -175,6 +208,10 @@ class TropicalCausalSelfAttention(nn.Module):
         # Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
+    def set_temperature(self, new_temperature: float):
+        """Set the temperature for annealing. Called externally during training."""
+        self.temperature.fill_(new_temperature)
 
 class MLP(nn.Module):
 
@@ -205,8 +242,19 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x, abacus_emb=None):
+        """
+        Forward pass with optional Abacus embedding injection.
+
+        Args:
+            x: Input tensor (B, T, C)
+            abacus_emb: Optional Abacus significance embeddings (B, T, C)
+                        If provided, added as skip connection after attention.
+        """
         x = x + self.attn(self.ln_1(x))
+        # Inject Abacus embeddings as skip connection (if provided)
+        if abacus_emb is not None:
+            x = x + abacus_emb
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -221,6 +269,10 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     tropical_attention: bool = False  # Use Tropical (Max-Plus) attention instead of standard
     tropical_temperature: float = 1.0  # Temperature for LogSumExp (annealed toward 0 during training)
+    # Abacus Embeddings: positional encoding based on digit significance (power of 10)
+    use_abacus: bool = False  # Enable Abacus significance embeddings
+    max_significance: int = 32  # Max significance level (supports up to 10^31)
+    abacus_inject_every_layer: bool = True  # Inject Abacus embeddings at every layer (not just first)
 
 class GPT(nn.Module):
 
@@ -230,13 +282,22 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
+        # Core transformer components
+        transformer_dict = dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        )
+
+        # Abacus Embeddings: significance-based positional encoding
+        # wse = "word significance embedding" (parallel to wpe = "word position embedding")
+        if getattr(config, 'use_abacus', False):
+            max_sig = getattr(config, 'max_significance', 32)
+            transformer_dict['wse'] = nn.Embedding(max_sig, config.n_embd)
+
+        self.transformer = nn.ModuleDict(transformer_dict)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -274,27 +335,62 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, significance_ids=None):
+        """
+        Forward pass of the GPT model.
+
+        Args:
+            idx: Token indices (B, T)
+            targets: Target token indices for loss computation (B, T), optional
+            significance_ids: Abacus significance IDs (B, T), optional
+                              0 = non-digit, 1 = units (10^0), 2 = tens (10^1), etc.
+
+        Returns:
+            logits: Output logits (B, T, vocab_size) or (B, 1, vocab_size) if no targets
+            loss: Cross-entropy loss if targets provided, else None
+        """
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # === EMBEDDING LAYER ===
+        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
+
+        # Hybrid positional encoding: Standard PE + Abacus PE
+        x = tok_emb + pos_emb
+
+        # Compute Abacus embeddings if enabled and significance_ids provided
+        abacus_emb = None
+        if self.config.use_abacus and significance_ids is not None:
+            # Clamp significance to valid range
+            max_sig = self.config.max_significance
+            sig_clamped = significance_ids.clamp(0, max_sig - 1)
+            abacus_emb = self.transformer.wse(sig_clamped)  # (B, T, n_embd)
+            # Add Abacus embeddings to initial representation
+            x = x + abacus_emb
+
+        x = self.transformer.drop(x)
+
+        # === TRANSFORMER BLOCKS ===
+        # Optionally inject Abacus embeddings at every layer
+        inject_every_layer = getattr(self.config, 'abacus_inject_every_layer', True)
+        layer_abacus = abacus_emb if inject_every_layer else None
+
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, abacus_emb=layer_abacus)
+
         x = self.transformer.ln_f(x)
 
+        # === OUTPUT LAYER ===
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
+            # Training: compute loss over all positions
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # Inference: only compute logits for last position (optimization)
+            logits = self.lm_head(x[:, [-1], :])  # (B, 1, vocab_size)
             loss = None
 
         return logits, loss
@@ -392,6 +488,18 @@ class GPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
+
+    def set_tropical_temperature(self, temperature: float):
+        """
+        Set the temperature for all Tropical attention layers.
+        Used for temperature annealing during training.
+
+        Args:
+            temperature: New temperature value (1.0 = softmax-like, 0.01 = hard max)
+        """
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'set_temperature'):
+                block.attn.set_temperature(temperature)
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
