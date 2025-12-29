@@ -13,3 +13,4 @@ venv/
 .venv/
 .claude/
 out-*/
+*.log
