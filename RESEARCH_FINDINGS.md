@@ -117,36 +117,32 @@ Tested binary representation where carries are explicit:
 
 **Key Finding**: Tropical attention COMPLETELY FAILS on binary addition. Standard GPT nearly masters it while Tropical cannot learn it at all. This is strong evidence against the tropical attention hypothesis.
 
-### 3.7 Follow-up Experiment: Abacus Embeddings + Tropical Attention (TropiGPT v2)
+### 3.7 Follow-up Experiment: Longer Training (10k-50k iterations)
 
 **Date**: December 29, 2024
 
-Implemented comprehensive TropiGPT with:
-- **Abacus Embeddings**: Position encoding based on digit significance (10^0, 10^1, etc.)
-- **Tropical Attention**: LogSumExp approximation with temperature annealing (1.0 → 0.01)
-- **Training**: 2000 iterations on 1-10 digit addition, batch_size=16/64
+Extended training revealed that **2k iterations was insufficient**. With longer training:
 
-| Configuration | Val Loss | Exact Match | Answer Digit Acc |
-|--------------|----------|-------------|------------------|
-| Baseline | 0.172 | 0% | 12.3% |
-| Abacus Only | **0.135** | 0% | 11.6% |
-| Tropical Only | 0.172 | 0% | **22.4%** |
-| TropiGPT (both) | 0.152 | 0% | 19.8% |
+| Configuration | 3-digit | 5-digit | 10-digit | 15-digit (OOD) | Val Loss |
+|--------------|---------|---------|----------|----------------|----------|
+| **Abacus (50k)** | **99%** | **97%** | **96%** | 0% | 0.089 |
+| Baseline (50k) | 98% | 96% | 85% | 0% | 0.107 |
+| **Abacus (10k)** | **97%** | **95%** | **45%** | 0% | 0.090 |
+| Baseline (10k) | 37% | 10% | 0% | 0% | 0.123 |
+| All 2k configs | 0% | 0% | 0% | 0% | 0.13-0.17 |
 
-**Key Finding**: Tropical attention **doubles** per-digit accuracy on answer tokens (22.4% vs 12.3% baseline). However, 0% exact match remains because multi-digit answers require ALL digits correct.
+**Key Findings:**
 
-**Per-Category Token Accuracy Analysis** (Abacus model):
-| Token Type | Accuracy | Notes |
-|------------|----------|-------|
-| Operators (+, =) | 100% | Perfect |
-| Spaces | 100% | Perfect |
-| Newlines | 100% | Perfect |
-| Input Digits | 10% | Random guessing |
-| Answer Digits | 11-22% | Slightly above random |
+1. **Abacus embeddings are highly effective**: 96% vs 85% on 10-digit addition at 50k iterations
+2. **Training duration matters**: 2k iterations shows 0% accuracy; 10k shows emergence; 50k achieves near-perfect ID accuracy
+3. **OOD generalization still fails**: 0% on 15-20 digit for ALL configurations (positional overfitting)
+4. **Loss is misleading at low iterations**: 0.17 loss at 2k vs 0.09 loss at 50k, but accuracy difference is 0% vs 96%
 
-The models learn **format perfectly** but only slightly better than random on **actual digits**. The low validation loss (0.13-0.17) is driven by perfect prediction of non-digit tokens.
+### 3.8 Tropical Attention Status
 
-### 3.8 Conclusion
+Tropical attention experiments on MPS (Mac M4) were extremely slow (~13 hours for 10k iterations) and were killed before convergence. CUDA experiments on RTX 3080 are needed for fair comparison.
+
+### 3.9 Conclusion
 
 **Standard GPT outperforms Tropical GPT across ALL experiments.**
 
