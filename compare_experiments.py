@@ -169,8 +169,13 @@ def main():
         ("out-abacus-10k-cuda/ckpt.pt", "Abacus (10k CUDA)"),
         ("out-tropical-10k-cuda/ckpt.pt", "Tropical (10k CUDA)"),
         ("out-tropigpt-10k-cuda/ckpt.pt", "TropiGPT (10k CUDA)"),
-        # 50k iteration experiments
+        # 50k iteration experiments (MPS)
+        ("out-baseline-50k/ckpt.pt", "Baseline (50k)"),
+        ("out-abacus-50k/ckpt.pt", "Abacus (50k)"),
         ("out-tropigpt-50k/ckpt.pt", "TropiGPT (50k)"),
+        # 50k iteration experiments (CUDA)
+        ("out-baseline-50k-cuda/ckpt.pt", "Baseline (50k CUDA)"),
+        ("out-abacus-50k-cuda/ckpt.pt", "Abacus (50k CUDA)"),
         ("out-tropigpt-50k-cuda/ckpt.pt", "TropiGPT (50k CUDA)"),
     ]
 
