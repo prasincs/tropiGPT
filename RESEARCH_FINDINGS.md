@@ -48,11 +48,40 @@ tropical_max(x) ≈ T * log(sum(exp(x/T)))
 
 Training anneals T from 1.0 → 0.1 over the course of training.
 
-### 2.3 Task: 3-Digit Addition
+### 2.3 Abacus Embeddings
 
-- **Format**: `"123+456=0579\n"` (zero-padded result)
-- **Training data**: 50,000 random 3-digit addition problems
-- **Vocabulary**: 13 tokens (`0-9`, `+`, `=`, `\n`)
+Located in `model.py`, significance-based positional encoding:
+
+```python
+# Each digit gets an embedding based on its place value (10^0, 10^1, etc.)
+# "123" → significance [3, 2, 1] (hundreds, tens, ones)
+# Operators and spaces get significance 0
+```
+
+This helps the model learn that digits at the same significance level (ones, tens, etc.) should interact similarly, regardless of absolute position.
+
+### 2.4 Muon Optimizer
+
+Newton-Schulz orthogonalization for weight matrices:
+
+```python
+# Only for 2D weight matrices (not embeddings, biases, layernorms)
+# X_{k+1} = 0.5 * X_k @ (3I - X_k^T @ X_k)
+```
+
+### 2.5 ArithmeticDataset
+
+Located in `data/arithmetic_dataset.py`:
+- Infinite IterableDataset for addition problems
+- Character-level tokenization (vocabulary size 14)
+- Returns `(input_ids, significance_ids, target_ids)`
+- Configurable digit range (1-10 digits for training)
+
+### 2.6 Task: Variable-Length Addition
+
+- **Format**: `"123 + 456 = 579\n"` (natural format with spaces)
+- **Training data**: Infinite stream, 1-10 digit operands
+- **Vocabulary**: 14 tokens (`0-9`, `+`, `=`, ` `, `\n`)
 
 ---
 
@@ -223,41 +252,119 @@ Focus on per-digit accuracy rather than exact match when comparing approaches. A
 
 ## 6. Files in This Branch
 
+### Core Implementation
 | File | Description |
 |------|-------------|
-| `model.py` | Added `TropicalCausalSelfAttention` class |
-| `train.py` | Added temperature annealing for tropical attention |
-| `config/train_adder_standard.py` | Standard GPT config for addition task |
-| `config/train_adder_tropical.py` | Tropical GPT config for addition task |
-| `data/adder/prepare.py` | Dataset generation for 3-digit addition |
-| `evaluate_arithmetic.py` | Basic evaluation script |
-| `evaluate_generalization.py` | Comprehensive multi-length evaluation |
-| `EVALUATION_GUIDE.md` | Guide for interpreting results |
+| `model.py` | GPT with Tropical Attention, Abacus Embeddings, Muon optimizer |
+| `train_arithmetic.py` | Training script with temperature annealing & evaluation |
+| `data/arithmetic_dataset.py` | ArithmeticDataset with character-level tokenization |
+| `compare_experiments.py` | Checkpoint evaluation and comparison script |
+
+### Experiment Configs
+| File | Description |
+|------|-------------|
+| `config/train_adder_standard.py` | Standard GPT for 3-digit addition |
+| `config/train_adder_tropical.py` | Tropical GPT for 3-digit addition |
+| `config/train_variable_*.py` | Variable-length training configs |
+| `config/train_reversed_*.py` | Reversed digit order configs |
+| `config/train_binary_*.py` | Binary addition configs |
+
+### Experiment Runners
+| File | Description |
+|------|-------------|
+| `run_cuda_experiments.sh` | CUDA experiment runner (RTX 3080) |
+| `run_experiment.py` | Generic experiment runner |
+
+### Evaluation Scripts
+| File | Description |
+|------|-------------|
+| `eval_variable.py` | Variable-length evaluation |
+| `eval_reversed.py` | Reversed digit evaluation |
+| `evaluate_binary.py` | Binary addition evaluation |
 
 ---
 
 ## 7. Reproduction
 
+### Quick Start (MPS / Mac)
+
 ```bash
 # Setup
-uv venv && uv pip install torch numpy transformers datasets tiktoken wandb tqdm
+uv venv && uv pip install torch numpy transformers datasets tiktoken tqdm
 
-# Generate data
-.venv/bin/python data/adder/prepare.py
+# Run experiments (non-tropical are fast)
+PYTHONUNBUFFERED=1 .venv/bin/python train_arithmetic.py \
+    --max_iters=50000 --eval_interval=5000 \
+    --tropical_attention=False --use_abacus=True \
+    --out_dir=out-abacus-50k
 
-# Train both models
-.venv/bin/python train.py config/train_adder_standard.py
-.venv/bin/python train.py config/train_adder_tropical.py
-
-# Evaluate
-.venv/bin/python evaluate_generalization.py --samples 200
+# Compare all checkpoints
+.venv/bin/python compare_experiments.py
 ```
+
+### CUDA (RTX 3080 or similar)
+
+```bash
+# Setup and run all 4 configurations
+./run_cuda_experiments.sh
+
+# Or individually with larger batch size
+PYTHONUNBUFFERED=1 .venv/bin/python train_arithmetic.py \
+    --max_iters=10000 --batch_size=64 \
+    --tropical_attention=True --use_abacus=True \
+    --out_dir=out-tropigpt-10k-cuda
+```
+
+### Experiment Configurations
+
+| Flag | Description |
+|------|-------------|
+| `--tropical_attention=True` | Enable Tropical (Max-Plus) attention |
+| `--use_abacus=True` | Enable Abacus (significance) embeddings |
+| `--use_muon=True` | Enable Muon optimizer |
+| `--reverse_digits=True` | LSB-first digit order |
+| `--batch_size=N` | Batch size (64 for CUDA, 16-64 for MPS) |
+| `--max_iters=N` | Training iterations (need 10k+ for learning) |
 
 ---
 
-## 8. Key Takeaway
+## 8. Current Status (December 29, 2025)
 
-> **Tropical attention is a valid, learnable attention mechanism**, but it does not solve length generalization for arithmetic when trained on fixed-length sequences. The fundamental challenge of positional generalization requires architectural changes (relative positions) or training data changes (variable lengths) rather than just modifying the attention semiring.
+### Completed Experiments (MPS - Mac M4)
+
+| Experiment | Iterations | Status | Best Result |
+|------------|------------|--------|-------------|
+| Baseline | 2k, 10k, 50k | ✅ Done | 98%/96%/85% (3/5/10-digit) |
+| Abacus | 2k, 10k, 50k | ✅ Done | **99%/97%/96%** (3/5/10-digit) |
+| Tropical | 2k | ✅ Done | 0% (but 2x per-digit accuracy) |
+| TropiGPT | 2k | ✅ Done | 0% |
+
+### Pending Experiments (CUDA - RTX 3080)
+
+| Experiment | Iterations | Status | Notes |
+|------------|------------|--------|-------|
+| Tropical | 10k | ⏳ Pending | Too slow on MPS (~13h) |
+| TropiGPT | 10k | ⏳ Pending | Too slow on MPS |
+| All configs | 10k | ⏳ Pending | `./run_cuda_experiments.sh` |
+
+### Key Finding So Far
+
+**Abacus embeddings provide significant improvement:**
+- 96% vs 85% accuracy on 10-digit addition (11% absolute improvement)
+- Achieves near-perfect accuracy (99%) on 3-digit with 50k iterations
+- Faster convergence than baseline
+
+**OOD generalization remains unsolved:**
+- 0% accuracy on 15-20 digit for ALL configurations
+- Positional overfitting is the core problem
+
+---
+
+## 9. Key Takeaway
+
+> **Abacus embeddings (significance-based positional encoding) significantly improve arithmetic learning**, achieving 96% accuracy on 10-digit addition vs 85% for baseline. However, **OOD length generalization remains unsolved** - all models fail at 15+ digits due to positional overfitting.
+>
+> **Tropical attention needs further evaluation on CUDA** - MPS experiments were too slow to complete. Early results (2k iterations) showed 2x improvement in per-digit accuracy but 0% exact match.
 
 ---
 
