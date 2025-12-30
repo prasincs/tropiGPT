@@ -2,7 +2,7 @@
 
 ## Experiment: Categorical Deep Learning for Arithmetic Generalization
 
-**Date**: December 2024
+**Date**: December 2025
 **Branch**: `tropical-attention-research`
 
 ---
@@ -119,7 +119,7 @@ Tested binary representation where carries are explicit:
 
 ### 3.7 Follow-up Experiment: Longer Training (10k-50k iterations)
 
-**Date**: December 29, 2024
+**Date**: December 29, 2025
 
 Extended training revealed that **2k iterations was insufficient**. With longer training:
 
